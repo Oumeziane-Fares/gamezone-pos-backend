@@ -1,6 +1,5 @@
 import db from '../db/knex';
 import { ulid } from 'ulid';
-import { getHourlyRateForMode } from './consoleService';
 
 interface CartItem {
   productId: string;
@@ -42,12 +41,18 @@ export const processCheckout = async (
   items: CartItem[],
   paymentMethod: string,
   sessionId?: string,
-  manualConsolePrice?: number // Manual price override parameter
+  manualConsolePrice?: number
 ): Promise<Receipt> => {
   return db.transaction(async (trx) => {
     let subtotal = 0;
-    const receiptItemsData = [];
-    let consoleUsageData = null;
+    const receiptItemsData: Array<{
+      product_id: string;
+      product_name: string;
+      quantity: number;
+      unit_price: number;
+      subtotal: number;
+    }> = [];
+
     let calculatedConsolePrice = 0;
     let finalConsolePrice = 0;
     let gamingMode: '1v1' | '2v2' = '1v1';
@@ -55,54 +60,38 @@ export const processCheckout = async (
     let hourlyRate2v2 = 0;
     let usedHourlyRate = 0;
 
-    // Handle session checkout with gaming mode support
+    // Handle session-based console charge
+    let consoleUsageData: Receipt['consoleUsage'] | null = null;
     if (sessionId) {
       const session = await trx('sessions').where({ id: sessionId }).first();
 
-      if (!session) {
-        throw new Error('Session not found.');
-      }
-      if (session.status !== 'ended') {
-        throw new Error('Session has not been ended yet.');
-      }
-      
-      const existingReceipt = await trx('receipts').where({ session_id: sessionId }).first();
-      if (existingReceipt) {
-        throw new Error('This session has already been paid for.');
-      }
+      if (!session) throw new Error('Session not found.');
+      if (session.status !== 'ended') throw new Error('Session has not been ended yet.');
 
-      // Ensure the final_cost exists and is a valid number
-      if (session.final_cost === null || session.final_cost === undefined || isNaN(parseFloat(session.final_cost.toString()))) {
+      const existingReceipt = await trx('receipts').where({ session_id: sessionId }).first();
+      if (existingReceipt) throw new Error('This session has already been paid for.');
+
+      if (session.final_cost == null || isNaN(Number(session.final_cost))) {
         throw new Error('Session cost has not been calculated. Cannot process checkout.');
       }
 
-      // Get console details with both rates
       const console = await trx('consoles').where({ id: session.console_id }).first();
-      if (!console) {
-        throw new Error('Console not found for this session.');
-      }
+      if (!console) throw new Error('Console not found for this session.');
 
-      // Extract gaming mode and rates
-      gamingMode = session.gaming_mode || '1v1'; // Default to 1v1 if not set
-      baseHourlyRate = parseFloat(console.hourly_rate || '0');
-      hourlyRate2v2 = parseFloat(console.hourly_rate_2v2 || baseHourlyRate * 1.5);
+      gamingMode = session.gaming_mode || '1v1';
+      baseHourlyRate = Number(console.hourly_rate || 0);
+      hourlyRate2v2 = Number(console.hourly_rate_2v2 || baseHourlyRate * 1.5);
       usedHourlyRate = gamingMode === '2v2' ? hourlyRate2v2 : baseHourlyRate;
 
-      calculatedConsolePrice = parseFloat(session.final_cost.toString());
-      
-      // Use manual price if provided, otherwise use calculated price
-      finalConsolePrice = manualConsolePrice !== undefined && manualConsolePrice !== null 
-        ? parseFloat(manualConsolePrice.toString()) 
-        : calculatedConsolePrice;
+      calculatedConsolePrice = Number(session.final_cost);
+      // If manualConsolePrice is provided, use it; else use calculated
+      finalConsolePrice =
+        manualConsolePrice != null ? Number(manualConsolePrice) : calculatedConsolePrice;
 
-      // Validate manual price (optional: can't be negative)
-      if (finalConsolePrice < 0) {
-        throw new Error('Console price cannot be negative.');
-      }
+      if (finalConsolePrice < 0) throw new Error('Console price cannot be negative.');
 
-      subtotal += finalConsolePrice; // Use the final price (manual or calculated)
+      subtotal += finalConsolePrice;
 
-      // Calculate session duration
       const activeDurationMs =
         new Date(session.end_time).getTime() -
         new Date(session.start_time).getTime() -
@@ -111,58 +100,40 @@ export const processCheckout = async (
       consoleUsageData = {
         consoleName: console?.name || 'Unknown Console',
         consoleType: console?.type || 'N/A',
-        gamingMode: gamingMode, // NEW: Gaming mode used
-        duration: Math.round(activeDurationMs / 60000), // Duration in minutes
-        rate: usedHourlyRate, // NEW: The actual rate used
-        baseRate: baseHourlyRate, // NEW: Console's base rate
-        rate2v2: hourlyRate2v2, // NEW: Console's 2v2 rate
-        calculatedCost: calculatedConsolePrice, // Store original calculated cost
-        finalCost: finalConsolePrice, // Store what we actually charged
+        gamingMode,
+        duration: Math.round(activeDurationMs / 60000),
+        rate: usedHourlyRate,
+        baseRate: baseHourlyRate,
+        rate2v2: hourlyRate2v2,
+        calculatedCost: calculatedConsolePrice,
+        finalCost: finalConsolePrice,
         subtotal: finalConsolePrice,
       };
     }
 
-        // --- START NEW LOGIC ---
-    // Fetch items from the session's "running tab"
-    if (sessionId) {
-      const sessionItems = await trx('session_items').where({ session_id: sessionId });
-      
-      for (const item of sessionItems) {
-        subtotal += parseFloat(item.subtotal);
-        receiptItemsData.push({
-          product_id: item.product_id,
-          // You might want to fetch the current product name here or store it on session_items
-          product_name: 'Product Name from Tab', // Placeholder
-          quantity: item.quantity,
-          unit_price: parseFloat(item.unit_price),
-          subtotal: parseFloat(item.subtotal),
-        });
-      }
-    }
-    // --- END NEW LOGIC ---
+    // IMPORTANT: Do NOT also add session_items if the client already sent items.
+    // The CheckoutPage loads session items into its cart and sends them.
+    // So we rely solely on `items` from the client to avoid double counting.
 
-    // Process inventory items (unchanged)
+    // Process items from client cart
     for (const item of items) {
       const product = await trx('products').where('id', item.productId).forUpdate().first();
-
-      if (!product) {
-        throw new Error(`Product with ID ${item.productId} not found.`);
-      }
+      if (!product) throw new Error(`Product with ID ${item.productId} not found.`);
       if (product.stock < item.quantity) {
         throw new Error(`Not enough stock for ${product.name}. Available: ${product.stock}`);
       }
 
-      // Update product stock
       await trx('products').where('id', item.productId).decrement('stock', item.quantity);
 
-      const itemSubtotal = parseFloat(product.price) * item.quantity;
+      const unitPrice = Number(product.price);
+      const itemSubtotal = unitPrice * item.quantity;
       subtotal += itemSubtotal;
 
       receiptItemsData.push({
         product_id: item.productId,
         product_name: product.name,
         quantity: item.quantity,
-        unit_price: parseFloat(product.price),
+        unit_price: unitPrice,
         subtotal: itemSubtotal,
       });
     }
@@ -170,22 +141,23 @@ export const processCheckout = async (
     const tax = subtotal * TAX_RATE;
     const total = subtotal + tax;
 
-    // Create receipt with enhanced gaming mode tracking
     const newReceiptData = {
       id: `rec_${ulid()}`,
-      subtotal: subtotal.toFixed(2),
-      tax: tax.toFixed(2),
-      total: total.toFixed(2),
+      subtotal: Number(subtotal.toFixed(2)),
+      tax: Number(tax.toFixed(2)),
+      total: Number(total.toFixed(2)),
       payment_method: paymentMethod,
       session_id: sessionId || null,
-      // Enhanced fields for gaming mode tracking
-      manual_console_price: manualConsolePrice !== undefined && sessionId ? finalConsolePrice.toFixed(2) : null,
-      calculated_console_price: sessionId ? calculatedConsolePrice.toFixed(2) : null,
-      gaming_mode: sessionId ? gamingMode : null, // NEW
-      base_hourly_rate: sessionId ? baseHourlyRate.toFixed(2) : null, // NEW
-      hourly_rate_2v2: sessionId ? hourlyRate2v2.toFixed(2) : null, // NEW
+      // Save manual/ calculated console price if this is a session checkout
+      manual_console_price:
+        sessionId && manualConsolePrice != null ? Number(finalConsolePrice.toFixed(2)) : null,
+      calculated_console_price:
+        sessionId ? Number(calculatedConsolePrice.toFixed(2)) : null,
+      gaming_mode: sessionId ? gamingMode : null,
+      base_hourly_rate: sessionId ? Number(baseHourlyRate.toFixed(2)) : null,
+      hourly_rate_2v2: sessionId ? Number(hourlyRate2v2.toFixed(2)) : null,
     };
-    
+
     console.log('Creating receipt with gaming mode data:', {
       id: newReceiptData.id,
       gamingMode,
@@ -193,25 +165,32 @@ export const processCheckout = async (
       rate2v2: hourlyRate2v2,
       usedRate: usedHourlyRate,
       calculatedPrice: calculatedConsolePrice,
-      finalPrice: finalConsolePrice
+      finalPrice: finalConsolePrice,
+      manualProvided: manualConsolePrice != null,
     });
-    
-    const [receipt] = await trx('receipts').insert(newReceiptData).returning('*');
 
-    // Insert receipt items (unchanged)
+    // Insert receipt
+    let insertedReceipt: any;
+    try {
+      [insertedReceipt] = await trx('receipts').insert(newReceiptData).returning('*');
+    } catch {
+      await trx('receipts').insert(newReceiptData);
+      insertedReceipt = await trx('receipts').where({ id: newReceiptData.id }).first();
+    }
+
+    // Insert receipt items
     if (receiptItemsData.length > 0) {
-      const itemsToInsert = receiptItemsData.map((item) => ({ 
-        ...item, 
-        receipt_id: receipt.id 
+      const itemsToInsert = receiptItemsData.map((it) => ({
+        ...it,
+        receipt_id: insertedReceipt.id,
       }));
       await trx('receipt_items').insert(itemsToInsert);
     }
 
-    // Return properly formatted receipt with gaming mode data
     return {
-      id: receipt.id,
+      id: insertedReceipt.id,
       sessionId: sessionId || undefined,
-      consoleUsage: consoleUsageData,
+      consoleUsage: consoleUsageData || undefined,
       items: receiptItemsData.map(item => ({
         productId: item.product_id,
         productName: item.product_name,
@@ -219,15 +198,14 @@ export const processCheckout = async (
         unitPrice: item.unit_price,
         subtotal: item.subtotal
       })),
-      subtotal: parseFloat(receipt.subtotal),
-      tax: parseFloat(receipt.tax),
-      total: parseFloat(receipt.total),
-      paymentMethod: receipt.payment_method,
-      timestamp: new Date(receipt.created_at)
+      subtotal: Number(insertedReceipt.subtotal),
+      tax: Number(insertedReceipt.tax),
+      total: Number(insertedReceipt.total),
+      paymentMethod: insertedReceipt.payment_method,
+      timestamp: new Date(insertedReceipt.created_at),
     } as Receipt;
   });
 };
-
 // NEW: Calculate session cost based on gaming mode
 export const calculateSessionCost = async (sessionId: string, gamingMode: '1v1' | '2v2'): Promise<number> => {
   try {

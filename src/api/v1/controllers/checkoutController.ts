@@ -6,6 +6,9 @@ const checkoutSchema = z.object({
   paymentMethod: z.string(),
   sessionId: z.string().optional(),
   manualConsolePrice: z.number().min(0).optional(), // New field for manual console price
+  consoleUsage: z.object({
+    manualPrice: z.number().min(0).optional(),
+  }).optional(),
   items: z.array(z.object({
     productId: z.string(),
     quantity: z.number().int().positive(),
@@ -14,13 +17,17 @@ const checkoutSchema = z.object({
 
 export const handleCheckout = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { items, paymentMethod, sessionId, manualConsolePrice } = checkoutSchema.parse(req.body);
+    const parsed = checkoutSchema.parse(req.body);
+
+    // Prefer root-level manualConsolePrice; fallback to consoleUsage.manualPrice
+    const effectiveManualConsolePrice =
+      parsed.manualConsolePrice ?? parsed.consoleUsage?.manualPrice;
 
     const receipt = await checkoutService.processCheckout(
-      items, 
-      paymentMethod, 
-      sessionId, 
-      manualConsolePrice // Pass the manual price
+      parsed.items,
+      parsed.paymentMethod,
+      parsed.sessionId,
+      effectiveManualConsolePrice
     );
     
     res.status(201).json({

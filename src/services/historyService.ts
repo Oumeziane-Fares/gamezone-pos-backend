@@ -1,20 +1,40 @@
 import db from '../db/knex';
-
+type ReceiptItemWithDetails = {
+  subtotal: string | number;
+  product_name: string;
+  current_product_name: string;
+  category: string;
+  quantity: number;
+  unit_price: string | number;
+};
 export const findAllTransactions = async () => {
   try {
-    // 1. Fetch all receipts with manual price tracking and gaming mode, ordered by most recent first
-    const receipts = await db('receipts')
+    // QUERY 1: Get all receipts with their session and console data joined directly.
+    const receiptsAndSessions = await db('receipts')
+      .leftJoin('sessions', 'receipts.session_id', 'sessions.id')
+      .leftJoin('consoles', 'sessions.console_id', 'consoles.id')
       .select(
         'receipts.*',
-        'receipts.manual_console_price',
-        'receipts.calculated_console_price',
-        'receipts.gaming_mode',
-        'receipts.base_hourly_rate',
-        'receipts.hourly_rate_2v2'
+        'sessions.id as sessionId', // Alias to avoid clashes
+        'sessions.start_time',
+        'sessions.end_time',
+        'sessions.final_cost',
+        'sessions.total_paused_duration',
+        'sessions.gaming_mode as session_gaming_mode',
+        'consoles.name as consoleName',
+        'consoles.type as consoleType',
+        'consoles.hourly_rate as baseHourlyRate',
+        'consoles.hourly_rate_2v2 as hourlyRate2v2'
       )
-      .orderBy('created_at', 'desc');
+      .orderBy('receipts.created_at', 'desc');
 
-    // 2. Fetch all receipt items with product names
+    if (receiptsAndSessions.length === 0) {
+      return [];
+    }
+
+    const receiptIds = receiptsAndSessions.map(r => r.id);
+
+    // QUERY 2: Get all items for ONLY the receipts we found.
     const allItems = await db('receipt_items')
       .leftJoin('products', 'receipt_items.product_id', 'products.id')
       .select(
@@ -22,67 +42,58 @@ export const findAllTransactions = async () => {
         'receipt_items.quantity',
         'receipt_items.unit_price',
         'receipt_items.subtotal',
-        'receipt_items.product_name', // Use stored product name from receipt_items
-        'products.name as current_product_name', // Current product name (might have changed)
+        'receipt_items.product_name',
+        'products.name as current_product_name',
         'products.category'
-      );
+      )
+      .whereIn('receipt_items.receipt_id', receiptIds);
 
-    // 3. Fetch enhanced session details with gaming mode for all sessions linked to receipts
-    const sessions = await db('sessions')
-      .join('consoles', 'sessions.console_id', 'consoles.id')
-      .whereIn('sessions.id', receipts.map(r => r.session_id).filter(Boolean))
-      .select(
-        'sessions.id',
-        'sessions.start_time',
-        'sessions.end_time',
-        'sessions.final_cost',
-        'sessions.total_paused_duration',
-        'sessions.gaming_mode',
-        'consoles.name as consoleName',
-        'consoles.type as consoleType',
-        'consoles.hourly_rate as baseHourlyRate',
-        'consoles.hourly_rate_2v2 as hourlyRate2v2'
-      );
+    // Group items by receipt_id for quick lookups in memory
+    const itemsByReceiptId = allItems.reduce((acc, item) => {
+      if (!acc[item.receipt_id]) {
+        acc[item.receipt_id] = [];
+      }
+      acc[item.receipt_id].push(item);
+      return acc;
+    }, {} as Record<string, typeof allItems>);
 
-    // 4. Combine the data into a comprehensive, structured response
-    const transactions = receipts.map(receipt => {
-      const relatedItems = allItems.filter(item => item.receipt_id === receipt.id);
-      const relatedSession = sessions.find(session => session.id === receipt.session_id);
 
-      // Calculate console usage details with gaming mode support
+    // Combine the data efficiently in JavaScript
+    const transactions = receiptsAndSessions.map(receipt => {
+      const relatedItems = itemsByReceiptId[receipt.id] || [];
+      
       let consoleUsage = null;
-      if (relatedSession) {
-        const startTime = new Date(relatedSession.start_time);
-        const endTime = new Date(relatedSession.end_time);
+      if (receipt.sessionId) {
+        // All session and console data is already attached to the 'receipt' object from the join
+        const startTime = new Date(receipt.start_time);
+        const endTime = new Date(receipt.end_time);
         const totalDurationMs = endTime.getTime() - startTime.getTime();
-        const pausedDurationMs = relatedSession.total_paused_duration || 0;
+        const pausedDurationMs = receipt.total_paused_duration || 0;
         const activeDurationMs = Math.max(0, totalDurationMs - pausedDurationMs);
         const durationMinutes = Math.round(activeDurationMs / (1000 * 60));
 
-        // Determine gaming mode and rates used
-        const gamingMode = receipt.gaming_mode || relatedSession.gaming_mode || '1v1';
-        const baseRate = parseFloat(receipt.base_hourly_rate || relatedSession.baseHourlyRate || '0');
-        const rate2v2 = parseFloat(receipt.hourly_rate_2v2 || relatedSession.hourlyRate2v2 || baseRate * 1.5);
+        const gamingMode = receipt.gaming_mode || receipt.session_gaming_mode || '1v1';
+        const baseRate = parseFloat(receipt.base_hourly_rate || receipt.baseHourlyRate || '0');
+        const rate2v2 = parseFloat(receipt.hourly_rate_2v2 || receipt.hourlyRate2v2 || (baseRate * 1.5).toString());
         const usedRate = gamingMode === '2v2' ? rate2v2 : baseRate;
 
-        // Determine if manual price was used
-        const hasManualPrice = receipt.manual_console_price !== null && 
-                              receipt.calculated_console_price !== null &&
-                              parseFloat(receipt.manual_console_price) !== parseFloat(receipt.calculated_console_price);
+        const hasManualPrice = receipt.manual_console_price !== null &&
+                               receipt.calculated_console_price !== null &&
+                               parseFloat(receipt.manual_console_price) !== parseFloat(receipt.calculated_console_price);
 
-        const calculatedCost = parseFloat(receipt.calculated_console_price || relatedSession.final_cost || '0');
+        const calculatedCost = parseFloat(receipt.calculated_console_price || receipt.final_cost || '0');
         const actualCost = receipt.manual_console_price ? parseFloat(receipt.manual_console_price) : calculatedCost;
         const discountGiven = hasManualPrice ? calculatedCost - actualCost : 0;
 
         consoleUsage = {
-          consoleName: relatedSession.consoleName,
-          consoleType: relatedSession.consoleType,
-          gamingMode: gamingMode, // Gaming mode used (1v1 or 2v2)
+          consoleName: receipt.consoleName,
+          consoleType: receipt.consoleType,
+          gamingMode: gamingMode,
           duration: durationMinutes,
-          hourlyRate: usedRate, // The rate that was actually used
-          baseHourlyRate: baseRate, // Console's 1v1 rate
-          hourlyRate2v2: rate2v2, // Console's 2v2 rate
-          usedHourlyRate: usedRate, // Add this for compatibility
+          hourlyRate: usedRate,
+          baseHourlyRate: baseRate,
+          hourlyRate2v2: rate2v2,
+          usedHourlyRate: usedRate,
           calculatedCost: calculatedCost,
           actualCost: actualCost,
           discountGiven: discountGiven,
@@ -90,36 +101,30 @@ export const findAllTransactions = async () => {
           priceAdjustmentType: hasManualPrice ? (discountGiven > 0 ? 'discount' : 'surcharge') : 'none'
         };
       }
-
-      // Process items with enhanced details
-      const itemsSubtotal = relatedItems.reduce((sum, item) => {
-        return sum + parseFloat(item.subtotal || (item.quantity * item.unit_price));
+      
+      // FIXED: Add types for the accumulator (sum) and the item
+      const itemsSubtotal = relatedItems.reduce((sum: number, item: ReceiptItemWithDetails) => {
+        return sum + parseFloat(String(item.subtotal));
       }, 0);
-
+      
       return {
         id: receipt.id,
         timestamp: receipt.created_at,
-        total: parseFloat(receipt.total),
-        subtotal: parseFloat(receipt.subtotal),
-        tax: parseFloat(receipt.tax || '0'),
+        total: parseFloat(String(receipt.total)),
+        subtotal: parseFloat(String(receipt.subtotal)),
+        tax: parseFloat(String(receipt.tax || '0')),
         paymentMethod: receipt.payment_method,
-        
-        // Enhanced item details
-        items: relatedItems.map(item => ({
-          productName: item.product_name || item.current_product_name, // Prefer stored name
-          currentProductName: item.current_product_name, // Show if product name changed
+        items: relatedItems.map((item: ReceiptItemWithDetails) => ({
+          productName: item.product_name || item.current_product_name,
+          currentProductName: item.current_product_name,
           category: item.category,
           quantity: item.quantity,
-          unitPrice: parseFloat(item.unit_price),
-          subtotal: parseFloat(item.subtotal || (item.quantity * item.unit_price))
+          unitPrice: parseFloat(String(item.unit_price)),
+          subtotal: parseFloat(String(item.subtotal))
         })),
-        
-        // Enhanced console usage with gaming mode and manual price tracking
         consoleUsage,
-        
-        // Summary statistics for this transaction
         summary: {
-          itemsSubtotal: itemsSubtotal,
+          itemsSubtotal,
           consoleSubtotal: consoleUsage ? consoleUsage.actualCost : 0,
           originalConsoleSubtotal: consoleUsage ? consoleUsage.calculatedCost : 0,
           totalDiscount: consoleUsage ? consoleUsage.discountGiven : 0,

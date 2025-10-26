@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "nodemon --exec ts-node src/index.ts",
     "test": "jest",
+    "build": "tsc",
+    "start": "node dist/src/index.js",
     "knex": "ts-node ./node_modules/knex/bin/cli.js --knexfile knexfile.ts",
     "db:migrate": "npm run knex migrate:latest",
     "db:rollback": "npm run knex migrate:rollback",

@@ -9,6 +9,7 @@ import sessionRoutes from './api/v1/routes/sessionRoutes';
 import checkoutRoutes from './api/v1/routes/checkoutRoutes';
 import reportRoutes from './api/v1/routes/reportRoutes';
 import historyRoutes from './api/v1/routes/historyRoutes';
+import stockInvoiceRoutes from './api/v1/routes/stockInvoiceRoutes'; 
 
 dotenv.config();
 
@@ -29,6 +30,7 @@ app.use('/api/v1/sessions', sessionRoutes);
 app.use('/api/v1/checkout', checkoutRoutes);
 app.use('/api/v1/reports', reportRoutes);
 app.use('/api/v1/history', historyRoutes);
+app.use('/api/v1/stock-invoices', stockInvoiceRoutes);
 // Core Middleware
 
 
